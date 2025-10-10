@@ -3,7 +3,11 @@
 
 """Visualization utilities."""
 
+
+import time
+t_start = time.time()
 import os
+from collections import defaultdict
 
 # import cv2
 import numpy as np
@@ -25,6 +29,11 @@ except ImportError as e:
                 mandatory if you are running evaluation on HOT3d.
                 Refer to the README.md for installation instructions.
                 """)
+
+GLOBAL_TIMINGS = defaultdict(lambda : 0)
+POST_PROC_TIMINGS = defaultdict(lambda : 0)
+BBOX_TIMINGS = defaultdict(lambda : 0)
+GLOBAL_TIMINGS["t_import_vis"] = time.time() - t_start
 
 
 def draw_rect(im, rect, color=(1.0, 1.0, 1.0)):
@@ -135,6 +144,7 @@ def vis_object_poses(
       (i.e. only the closest object is visualized at each pixel).
     """
 
+    t_prep = time.time()
     # Indicators of visualization types.
     vis_rgb = vis_rgb_path is not None
     vis_depth_diff = vis_depth_diff_path is not None
@@ -165,9 +175,11 @@ def vis_object_poses(
     if vis_depth_diff or (vis_rgb and vis_rgb_resolve_visib):
         ren_depth = np.zeros((im_size[1], im_size[0]), np.float32)
 
+    GLOBAL_TIMINGS["t_vis_object_poses_prep"] += time.time() - t_prep
     # Render the pose estimates one by one.
     for pose in poses:
         # Rendering.
+        t_rend = time.time()
         if htt_available and isinstance(K, CameraModel): # hand_tracking_toolkit is used for rendering.
             ren_out = renderer.render_object(
                 pose["obj_id"], pose["R"], pose["t"], K
@@ -179,12 +191,15 @@ def vis_object_poses(
             )
         else:
             raise ValueError("Camera model 'K' type {} should be either CameraModel or np.ndarray".format(type(K)))
+        GLOBAL_TIMINGS["t_renders"] += time.time() - t_rend
 
+        t_post_proc = time.time()
         m_rgb = None
         if vis_rgb:
             m_rgb = ren_out["rgb"]
 
         m_mask = None
+        t_depth_mask = time.time()
         if vis_depth_diff or (vis_rgb and vis_rgb_resolve_visib):
             m_depth = ren_out["depth"]
 
@@ -194,19 +209,27 @@ def vis_object_poses(
             m_mask = np.logical_and(m_depth != 0, visible_mask)
 
             ren_depth[m_mask] = m_depth[m_mask].astype(ren_depth.dtype)
+        POST_PROC_TIMINGS["t_depth_mask"] += time.time() - t_depth_mask 
 
         # Combine the RGB renderings.
         if vis_rgb:
+            t_resolve_vis_rgb = time.time()
             if vis_rgb_resolve_visib:
                 ren_rgb[m_mask] = m_rgb[m_mask].astype(ren_rgb.dtype)
             else:
                 ren_rgb_f = ren_rgb.astype(np.float32) + m_rgb.astype(np.float32)
                 ren_rgb_f[ren_rgb_f > 255] = 255
                 ren_rgb = ren_rgb_f.astype(np.uint8)
+            POST_PROC_TIMINGS["t_resolve_vis_rgb"] += time.time() - t_resolve_vis_rgb
 
+            t_bbox_drawing = time.time()
             # Draw 2D bounding box and write text info.
+            # obj_mask = np.any(m_rgb > 0, axis=2)  # TODO: include
             obj_mask = np.sum(m_rgb > 0, axis=2)
+            BBOX_TIMINGS["t_obj_mask"] += time.time() - t_bbox_drawing
+            t_non_zero = time.time()
             ys, xs = obj_mask.nonzero()
+            BBOX_TIMINGS["t_non_zero"] += time.time() - t_non_zero
             if len(ys):
                 # bbox_color = model_color
                 # text_color = model_color
@@ -214,10 +237,15 @@ def vis_object_poses(
                 text_color = (1.0, 1.0, 1.0)
                 text_size = 11
 
+                t_calc_2d_bbox = time.time()
                 bbox = misc.calc_2d_bbox(xs, ys, im_size)
+                BBOX_TIMINGS["t_calc_2d_bbox"] += time.time() - t_calc_2d_bbox
                 im_size = (obj_mask.shape[1], obj_mask.shape[0])
+                t_draw_rect = time.time()
                 ren_rgb_info = draw_rect(ren_rgb_info, bbox, bbox_color)
+                BBOX_TIMINGS["t_draw_rect"] += time.time() - t_draw_rect
 
+                t_write_text = time.time()
                 if "text_info" in pose:
                     text_loc = (bbox[0] + 2, bbox[1])
                     ren_rgb_info = write_text_on_image(
@@ -227,23 +255,30 @@ def vis_object_poses(
                         color=text_color,
                         size=text_size,
                     )
+                BBOX_TIMINGS["t_write_text"] += time.time() - t_write_text
+            POST_PROC_TIMINGS["t_bbox_drawing"] += time.time() - t_bbox_drawing
+            
+        GLOBAL_TIMINGS["t_post_proc"] += time.time() - t_post_proc
 
     # Blend and save the RGB visualization.
+    t_post_proc = time.time()
     if vis_rgb:
+        t_vis_rgb_blend = time.time()
         misc.ensure_dir(os.path.dirname(vis_rgb_path))
-
         vis_im_rgb = (
             0.5 * rgb.astype(np.float32)
             + 0.5 * ren_rgb.astype(np.float32)
             + 1.0 * ren_rgb_info.astype(np.float32)
         )
         vis_im_rgb[vis_im_rgb > 255] = 255
-        inout.save_im(vis_rgb_path, vis_im_rgb.astype(np.uint8), jpg_quality=95)
+        POST_PROC_TIMINGS["t_vis_rgb_blend"] += time.time() - t_vis_rgb_blend 
 
     # Save the image of depth differences.
     if vis_depth_diff:
+        t_depth_diff = time.time()
         misc.ensure_dir(os.path.dirname(vis_depth_diff_path))
 
+        t_post_proc = time.time()
         # Calculate the depth difference at pixels where both depth maps are valid.
         valid_mask = (depth > 0) * (ren_depth > 0)
         depth_diff = valid_mask * (ren_depth.astype(np.float32) - depth)
@@ -272,4 +307,13 @@ def vis_object_poses(
             {"name": "25 percentile", "fmt": ":.3f", "val": np.percentile(np.abs(depth_diff_valid), 25)},
         ]
         depth_diff_vis = write_text_on_image(depth_diff_vis, depth_info)
+        POST_PROC_TIMINGS["t_depth_diff"] += time.time() - t_depth_diff 
+    GLOBAL_TIMINGS["t_post_proc"] += time.time() - t_post_proc
+
+    t_save_vis = time.time()
+    if vis_rgb:
+        inout.save_im(vis_rgb_path, vis_im_rgb.astype(np.uint8), jpg_quality=95)
+    if vis_depth_diff:
         inout.save_im(vis_depth_diff_path, depth_diff_vis)
+
+    GLOBAL_TIMINGS["t_save_vis"] += time.time() - t_save_vis

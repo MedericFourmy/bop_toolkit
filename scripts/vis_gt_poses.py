@@ -7,6 +7,8 @@ The script visualize datasets in the classical BOP19 format as well as the HOT3D
 """
 
 import os
+import time
+t_start = time.time()
 import argparse
 from pathlib import Path
 
@@ -38,15 +40,16 @@ except ImportError as e:
 ################################################################################
 p = {
     # See dataset_params.py for options.
-    "dataset": "ycbv",
+    "dataset": "ipd",
     # Dataset split. Options: 'train', 'val', 'test'.
-    "dataset_split": "test",
+    "dataset_split": "val",
     # Dataset split type. None = default. See dataset_params.py for options.
     "dataset_split_type": None,
     # File with a list of estimation targets used to determine the set of images
     # for which the GT poses will be visualized. The file is assumed to be stored
     # in the dataset folder. None = all images.
-    'targets_filename': 'test_targets_bop19.json',
+    # 'targets_filename': 'test_targets_bop19.json',
+    'targets_filename': 'val_targets_bop24.json',
     # "targets_filename": None,  # TODO: allow this option in argparse
     # Select ID's of scenes, images and GT poses to be processed.
     # Empty list [] means that all ID's will be used.
@@ -99,6 +102,15 @@ p = {
 }
 ################################################################################
 
+from collections import defaultdict
+VIS_GT_TIMINGS = defaultdict(lambda:0)
+VIS_GT_TIMINGS["t_imports"] = time.time() - t_start
+MAX_NB_IMGS = 50
+MAX_NB_GT = 120
+
+
+
+t_pre_loop = time.time()
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--dataset", type=str, default=p["dataset"])
@@ -111,6 +123,7 @@ misc.add_argument_bool(parser, "vis_orig_color", p["vis_orig_color"])
 parser.add_argument("--renderer_type", type=str, default=p["renderer_type"])
 parser.add_argument("--datasets_path", type=str, default=p["datasets_path"])
 parser.add_argument("--vis_path", type=str, default=p["vis_path"])
+parser.add_argument('--scene_ids', type=int, nargs='+', default=p["scene_ids"])
 args = parser.parse_args()
 
 # might be overriden if dataset is hot3d
@@ -161,8 +174,8 @@ else:
 
 # List of considered scenes.
 scene_ids_curr = dp_split["scene_ids"]
-if p["scene_ids"]:
-    scene_ids_curr = set(scene_ids_curr).intersection(p["scene_ids"])
+if args.scene_ids:
+    scene_ids_curr = set(scene_ids_curr).intersection(args.scene_ids)
     if len(scene_ids_curr) == 0:
         misc.log(f"Dataset scene ids {dp_split['scene_ids']} do not overlap with chosen scene ids {p['scene_ids']}")
 
@@ -178,6 +191,10 @@ renderer_mode = "+".join(renderer_modalities)
 width, height = None, None
 ren = None
 
+VIS_GT_TIMINGS["t_pre_loop"] = time.time() - t_pre_loop
+
+nb_imgs = 0
+nb_gt = 0
 for scene_id in scene_ids_curr:
     tpath_keys = dataset_params.scene_tpaths_keys(p["modality"], p["sensor"], scene_id)
     scene_modality = dataset_params.get_scene_sensor_or_modality(p["modality"], scene_id)
@@ -185,7 +202,9 @@ for scene_id in scene_ids_curr:
 
     # Create a new renderer if image size has changed
     scene_width, scene_height = dataset_params.get_im_size(dp_split, scene_modality, scene_sensor)
+    print(scene_width, scene_height)
     if (width, height) != (scene_width, scene_height):
+        t_model_load = time.time()
         width, height = scene_width, scene_height
         misc.log(f"Creating renderer of type {args.renderer_type}")
         ren = renderer.create_renderer(
@@ -200,6 +219,8 @@ for scene_id in scene_ids_curr:
                 model_color = tuple(colors[(obj_id - 1) % len(colors)])
             ren.add_object(obj_id, model_path, surf_color=model_color)
 
+        VIS_GT_TIMINGS["t_model_load"] += time.time() - t_model_load
+
     # Load scene info and ground-truth poses.
     scene_camera = inout.load_scene_camera(dp_split[tpath_keys["scene_camera_tpath"]].format(scene_id=scene_id))
     scene_gt = inout.load_scene_gt(dp_split[tpath_keys["scene_gt_tpath"]].format(scene_id=scene_id))
@@ -213,6 +234,10 @@ for scene_id in scene_ids_curr:
 
     # Render the object models in the ground-truth poses in the selected images.
     for im_counter, im_id in enumerate(im_ids):
+        nb_imgs += 1
+        # if nb_imgs > MAX_NB_IMGS: break
+        t_gt_load = time.time()
+
         if im_counter % 10 == 0:
             misc.log(
                 "Visualizing GT poses - dataset: {}, scene: {}, im: {}/{}".format(
@@ -234,6 +259,8 @@ for scene_id in scene_ids_curr:
         # Collect the ground-truth poses.
         gt_poses = []
         for gt_id in gt_ids_curr:
+            nb_gt += 1
+            if nb_gt > MAX_NB_GT: break
             gt = scene_gt[im_id][gt_id]
             # skip fully occluded masks - all values are -1
             if all(val == -1 for val in gt["cam_t_m2c"]):
@@ -252,6 +279,7 @@ for scene_id in scene_ids_curr:
                     ],
                 }
             )
+        if nb_gt > MAX_NB_GT: break
 
         # Load the color and depth images and prepare images for rendering.
         rgb = None
@@ -285,6 +313,7 @@ for scene_id in scene_ids_curr:
                 )
                 depth *= scene_camera[im_id]["depth_scale"]  # Convert to [mm].
 
+        VIS_GT_TIMINGS["t_gt_load"] += time.time() - t_gt_load
         # Path to the output RGB visualization.
         split = "{}_{}".format(args.dataset_split, scene_sensor) if scene_sensor else args.dataset_split 
         vis_rgb_path = None
@@ -319,10 +348,46 @@ for scene_id in scene_ids_curr:
             vis_depth_diff_path=vis_depth_diff_path,
             vis_rgb_resolve_visib=vis_rgb_resolve_visib,
         )
+    
     if args.vis_rgb:
         vis_scene_folder = Path(vis_rgb_path).parent
         print(f"Scene {scene_id} visualizations saved in {vis_scene_folder}")
     elif vis_depth_diff:
         vis_scene_folder = Path(vis_depth_diff_path).parent
         print(f"Scene {scene_id} visualizations saved in {vis_scene_folder}")
+
+    # if nb_imgs > MAX_NB_IMGS: break
+    if nb_gt > MAX_NB_GT: break
+
+from bop_toolkit_lib.visualization import GLOBAL_TIMINGS, POST_PROC_TIMINGS, BBOX_TIMINGS
+
+all_timings = {**VIS_GT_TIMINGS, **GLOBAL_TIMINGS}
+for k in all_timings: print(k)
+# for v in all_timings.values(): print(f"{v:.03f}")
+print("  for sheets")
+for v in all_timings.values(): print(f"{v:.03f}".replace(".", ","))
+
+print("\nPOST_PROC_TIMINGS\n")
+for k in POST_PROC_TIMINGS: print(k)
+# for v in POST_PROC_TIMINGS.values(): print(f"{v:.03f}")
+print("  for sheets")
+for v in POST_PROC_TIMINGS.values(): print(f"{v:.03f}".replace(".", ","))
+
+print("\nBBOX_TIMINGS\n")
+for k in BBOX_TIMINGS: print(k)
+# for v in BBOX_TIMINGS.values(): print(f"{v:.03f}")
+print("  for sheets")
+for v in BBOX_TIMINGS.values(): print(f"{v:.03f}".replace(".", ","))
+
+total_time = time.time() - t_start
+print("nb_imgs", nb_imgs)
+print("nb_gt", nb_gt)
+print("t_post_proc", GLOBAL_TIMINGS["t_post_proc"])
+print("t_bbox_drawing %", POST_PROC_TIMINGS["t_bbox_drawing"]/total_time)
+print("t_depth_diff %", POST_PROC_TIMINGS["t_depth_diff"]/total_time)
+print("total_time POST_PROC_TIMINGS", sum(POST_PROC_TIMINGS.values()))
+print("total_time BBOX_TIMINGS", sum(BBOX_TIMINGS.values()))
+print("total_time sum", sum(all_timings.values()))
+print("total_time", total_time)
+
 misc.log("Done.")
